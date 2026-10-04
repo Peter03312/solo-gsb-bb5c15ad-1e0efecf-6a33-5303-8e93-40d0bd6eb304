@@ -93,6 +93,7 @@ function renderAll() {
   renderReservations();
   renderSuspensions();
   renderRuns();
+  renderDevicesMaintenance();
 }
 
 function renderHoleMax(d) {
@@ -1359,6 +1360,148 @@ async function openRun(id) {
   $('#run-dialog').showModal();
 }
 $('#run-detail-close').addEventListener('click', () => $('#run-dialog').close());
+
+// ---------- 设备累计运行额度与保养 ----------
+
+const fmtSec = (v) => (v == null ? '—' : fmt(v));
+
+function renderDevicesMaintenance() {
+  // 设备编号 datalist（设备状态 + 运行中设备）
+  const devices = state.devices || [];
+  const devNos = new Set(devices.map((d) => d.deviceNo));
+  (state.runs || []).forEach((r) => devNos.add(r.deviceNo));
+  const options = [...devNos].sort().map((d) => `<option value="${escapeHtml(d)}"></option>`).join('');
+  $('#lim-device-list').innerHTML = options;
+  $('#mt-device-list').innerHTML = options;
+
+  const box = $('#device-list');
+  if (devices.length === 0) {
+    box.innerHTML = '<div class="muted">暂无任何设备记录（尚未开始过运行、未设上限、未登记保养）。</div>';
+  } else {
+    box.innerHTML = `<div class="table-wrap"><table class="res-table">
+      <thead><tr>
+        <th>设备</th><th>上限（秒）</th><th>本周期已完结累计（秒）</th>
+        <th>剩余额度（秒）</th><th>状态</th><th>最近一次保养</th><th>计入运行数</th>
+      </tr></thead><tbody>${devices
+        .map((d) => {
+          const due = d.limitSeconds != null && d.due;
+          return `<tr${due ? ' class="row-stale"' : ''}>
+        <td><b>${escapeHtml(d.deviceNo)}</b></td>
+        <td>${d.limitSeconds == null ? '<span class="muted">未设置</span>' : d.limitSeconds}</td>
+        <td class="mono">${fmtSec(d.usedSeconds)}</td>
+        <td class="mono">${
+          d.remainingSeconds == null
+            ? '<span class="muted">—</span>'
+            : d.remainingSeconds === 0
+              ? '0'
+              : fmtSec(d.remainingSeconds)
+        }${due && d.overSeconds > 0 ? `<br><span class="tag-bad">已超 ${fmt(d.overSeconds)} 秒</span>` : ''}</td>
+        <td>
+          ${
+            due
+              ? '<span class="badge bad">待保养（额度已用尽）</span>'
+              : d.limitSeconds == null
+                ? '<span class="badge ok">未设上限（原行为）</span>'
+                : '<span class="badge ok">额度内</span>'
+          }
+          ${
+            d.running
+              ? `<br><span class="badge stale">运行中 #${d.activeRunId}（不计入累计）</span>`
+              : '<br><span class="muted">空闲</span>'
+          }
+        </td>
+        <td class="mono">${
+          d.lastMaintenance
+            ? `#${d.lastMaintenance.id} ${d.lastMaintenance.periodStartedAt}<br>${escapeHtml(
+                d.lastMaintenance.reason,
+              )}`
+            : '<span class="muted">无（计入全部已完结运行）</span>'
+        }</td>
+        <td>${d.countedRuns} / ${d.totalRuns}</td>
+      </tr>`;
+        })
+        .join('')}</tbody></table></div>`;
+  }
+
+  const mts = state.maintenances || [];
+  const mtBox = $('#mt-list');
+  mtBox.innerHTML = mts.length
+    ? `<div class="table-wrap"><table class="res-table">
+        <thead><tr><th>#</th><th>保养单号</th><th>设备</th><th>原因</th>
+        <th>周期起点（服务端时刻，UTC）</th><th>登记时间</th></tr></thead>
+        <tbody>${mts
+          .map(
+            (m) => `<tr>
+          <td>${m.id}</td><td><b>${escapeHtml(m.maintenanceNo)}</b></td>
+          <td>${escapeHtml(m.deviceNo)}</td><td>${escapeHtml(m.reason)}</td>
+          <td class="mono">${m.periodStartedAt}</td><td class="mono">${m.createdAt}</td>
+        </tr>`,
+          )
+          .join('')}</tbody></table></div>`
+    : '<div class="muted">暂无保养记录。</div>';
+}
+
+$('#lim-save').addEventListener('click', async () => {
+  const body = {
+    deviceNo: $('#lim-device').value.trim(),
+    limitSeconds: Number($('#lim-seconds').value),
+  };
+  $('#lim-conflict').innerHTML = '';
+  try {
+    const r = await api('PUT', '/api/device-limits', body);
+    await refresh(
+      `设备「${r.deviceNo}」的累计运行时长上限已保存为 ${r.limitSeconds} 秒（仅影响后续开始判定，历史不改写）。`,
+    );
+  } catch (e) {
+    $('#lim-conflict').innerHTML = `<div class="banner bad"><ul>${(e.data && e.data.errors
+      ? e.data.errors
+      : [e.message]
+    )
+      .map((x) => `<li>${escapeHtml(x)}</li>`)
+      .join('')}</ul></div>`;
+    showAlert(e.message, 'err');
+  }
+});
+
+$('#lim-clear').addEventListener('click', async () => {
+  const deviceNo = $('#lim-device').value.trim();
+  if (!deviceNo) {
+    showAlert('请先填写要删除上限的设备编号', 'err');
+    return;
+  }
+  try {
+    await api('DELETE', `/api/device-limits/${encodeURIComponent(deviceNo)}`);
+    $('#lim-seconds').value = '';
+    await refresh(`设备「${deviceNo}」已恢复为未设置上限（开始运行沿用原行为）。`);
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+});
+
+$('#mt-submit').addEventListener('click', async () => {
+  const body = {
+    maintenanceNo: $('#mt-no').value.trim(),
+    deviceNo: $('#mt-device').value.trim(),
+    reason: $('#mt-reason').value.trim(),
+  };
+  $('#mt-conflict').innerHTML = '';
+  try {
+    const r = await api('POST', '/api/maintenances', body);
+    $('#mt-no').value = '';
+    $('#mt-reason').value = '';
+    await refresh(
+      `保养「${r.maintenanceNo}」已登记（设备「${r.deviceNo}」，#${r.id}）：新累计周期自 ${r.periodStartedAt} 开始。`,
+    );
+  } catch (e) {
+    $('#mt-conflict').innerHTML = `<div class="banner bad"><ul>${(e.data && e.data.errors
+      ? e.data.errors
+      : [e.message]
+    )
+      .map((x) => `<li>${escapeHtml(x)}</li>`)
+      .join('')}</ul></div>`;
+    showAlert(e.message, 'err');
+  }
+});
 
 // ---------- 启动 ----------
 

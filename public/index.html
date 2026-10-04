@@ -212,6 +212,8 @@
         任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论与预约时段；完结如实填写
         「完成 / 中止」，超过预约终点完结会标记<b>超时</b>，随即释放设备，不改写预约。
         相同运行编号同内容重复提交返回原记录，异内容拒绝；完结同状态重放返回原结果。
+        若设备已在「第 12 节」设置累计运行时长上限且自最近保养后的已完结累计<b>达到上限</b>，
+        开始会被拒绝（待保养），请先登记保养；未设置上限的设备不受影响。
       </div>
       <div class="form-row">
         <label>运行编号（唯一）
@@ -233,6 +235,53 @@
       <div id="run-conflict"></div>
       <h3>运行列表（含运行状态、超时标记与冻结依据）</h3>
       <div id="run-list"></div>
+    </section>
+
+    <section class="card" id="sec-maintenance">
+      <h2>12. 设备累计运行额度与保养</h2>
+      <div class="muted" style="margin-bottom:10px">
+        按设备编号设置<b>正整数秒</b>的累计运行时长上限。自最近一次保养后<b>已完结运行</b>
+        （完成 / 中止均按服务端起止时间计入，进行中不提前计入）的累计时长达到上限即为
+        <b>待保养</b>：运行即使越过上限也如实完结并释放设备，但之后开始新运行会被拒绝且不留记录，
+        须先登记保养开启新累计周期。<b>尚无保养记录</b>时计入该设备全部已完结运行；
+        <b>未设置上限</b>的设备沿用原行为。调整上限只影响后续开始判定，不改写运行与保养历史。
+      </div>
+      <h3>设置 / 调整上限（正整数秒）</h3>
+      <div class="form-row">
+        <label>设备编号
+          <input id="lim-device" type="text" placeholder="如 CENT-01" list="lim-device-list" />
+          <datalist id="lim-device-list"></datalist>
+        </label>
+        <label>累计运行时长上限（秒，正整数）
+          <input id="lim-seconds" type="number" min="1" step="1" placeholder="如 3600" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="lim-save" class="primary">保存上限</button>
+        <button id="lim-clear">删除该设备上限（恢复未设置）</button>
+      </div>
+      <div id="lim-conflict"></div>
+      <h3>登记保养（唯一保养单号 + 设备 + 原因；设备空闲时可登记）</h3>
+      <div class="form-row">
+        <label>保养单号（唯一）
+          <input id="mt-no" type="text" placeholder="如 MT-2026-001" />
+        </label>
+        <label>设备编号
+          <input id="mt-device" type="text" placeholder="如 CENT-01" list="mt-device-list" />
+          <datalist id="mt-device-list"></datalist>
+        </label>
+        <label>原因
+          <input id="mt-reason" type="text" placeholder="如：达到累计运行时长，例行保养" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="mt-submit" class="primary">登记保养（开启新累计周期）</button>
+      </div>
+      <div id="mt-conflict"></div>
+      <h3>设备状态（累计时长、剩余额度、待保养标记、进行中运行）</h3>
+      <div id="device-list"></div>
+      <h3>保养记录（按登记时间倒序）</h3>
+      <div id="mt-list"></div>
     </section>
   </main>
 

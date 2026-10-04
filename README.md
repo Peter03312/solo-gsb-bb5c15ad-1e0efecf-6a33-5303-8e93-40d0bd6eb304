@@ -66,6 +66,17 @@
 相同运行编号以**相同开始内容**重复提交返回原记录（200），**异内容拒绝**（409）；
 完结以**相同状态**重复提交返回原结果（200），**异状态拒绝**（409）。
 
+实验室按**设备累计运行时长**安排保养：可按设备编号设置**正整数秒数**的时长上限，
+随时查看设备自最近一次保养后**已完结运行**的累计时长、剩余额度与**待保养**状态。
+尚无保养记录时计入该设备**全部已完结运行**；完成与中止一律按**服务端起止时间**
+（结束 − 开始）计入，**进行中不提前计入**。运行即使越过上限也如实完结并释放设备；
+但**后续开始运行**须在开始运行的**原事务内**核对额度，累计达到上限即拒绝且**不留新运行**；
+**未设置上限的设备沿用原行为**。设备**空闲**时可凭**唯一保养单号、设备编号及原因**
+登记保养，登记的服务端时刻开启**新累计周期**（仅开始时刻不早于该时刻的已完结运行
+计入新周期）；保养单号为幂等键：**同号同内容重试返回原记录，异内容或设备运行中拒绝**。
+调整上限**仅影响后续开始判定**，不改写运行及保养历史；既有运行编号的幂等重放
+**不重新核对额度**，原运行接口的输入、状态码、幂等重放与冻结依据保持兼容。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径，孔 `i` 与孔 `(i+1)%N` 环形相邻。
@@ -210,12 +221,29 @@ npm test
        异状态 409。配置、库存或预约状态随后变化均不改写已冻结的运行历史。
     6. 点「查看冻结依据」可查看冻结发布图（含完整装载图与配置快照）、冻结核验结论
        （逐对径孔判定）与冻结预约时段。
+13. **设备累计运行额度与保养**（第 12 节页面）：
+    1. 在「设置 / 调整上限」处填写设备编号与**正整数秒**上限后保存（首次 201、
+       调整 200）；点「删除该设备上限」可恢复为未设置（后续开始运行沿用原行为）。
+    2. 「设备状态」表列出全部出现过的设备（有运行记录、已设上限或已登记保养）：
+       本周期已完结累计秒数、剩余额度、是否**待保养**、是否运行中（进行中不计入）、
+       最近一次保养与计入运行条数；未设置上限的设备仅展示累计供参考，不判定待保养。
+    3. 累计口径：完成 / 中止均按服务端起止时间计入；**尚无保养记录时计入全部已完结
+       运行**，有保养记录后仅计入最近一次保养（周期起点）之后**开始**的已完结运行；
+       运行即使越过上限也能正常完结，但越过之后设备标记「待保养」。
+    4. 待保养设备在第 11 节「开始离心运行」时会被整单拒绝（409，响应附
+       `maintenanceRequired`、已用秒数、上限、计入运行数），**不留任何运行记录**。
+    5. 设备**空闲**（无进行中运行）时，填写唯一保养单号与原因登记保养：
+       成功后以服务端登记时刻为起点开启新累计周期，累计与待保养状态立即归零重算；
+       同单号同内容重试返回原记录，同单号异内容 409（附 `existingId`），
+       设备运行中登记 409（附 `existingRunId`）且不留记录。
+    6. 调整上限立即影响「设备状态」与后续开始判定，但**不影响**任何运行/保养历史；
+       既有运行编号以相同内容重放仍返回原运行（200），不因额度变化被拒绝。
 
 ## REST API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`） |
+| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备状态（`devices`）、保养记录（`maintenances`）与设备上限（`deviceLimits`） |
 | PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务；缩小孔数使现有固定孔位越界时整次拒绝 |
 | PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚；替换后若留下失效避邻对（对中管不再存在）或失效固定孔位（管不存在或孔位不再可用）拒绝并保留原数据 |
 | PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚 |
@@ -240,11 +268,19 @@ npm test
 | GET | `/api/suspensions` | 停用列表（含状态、阶段 `notStarted/ongoing/ended/revoked`、是否可撤销、原因与撤销时间；含已撤销历史） |
 | GET | `/api/suspensions/:id` | 单条停用详情 |
 | POST | `/api/suspensions/:id/revoke` | 撤销停用（仅未开始）；已撤销幂等返回原记录；已开始/已结束 409；撤销后立即释放后续容量 |
-| POST | `/api/runs` | 开始离心运行（唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号；开始时间服务端记录）。事务内确认核验已完成、核验与生效预约同图、发布图当前可用、当前时刻处于预约左闭右开时段、预约未被其他运行使用、同设备无进行中运行；201 新建、200 同号同内容幂等重放、400 非法输入/未知核验或预约、409 状态冲突（附 `existingId`/`existingRunId`），失败不留记录 |
+| POST | `/api/runs` | 开始离心运行（唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号；开始时间服务端记录）。事务内确认核验已完成、核验与生效预约同图、发布图当前可用、当前时刻处于预约左闭右开时段、预约未被其他运行使用、同设备无进行中运行、**已设上限设备的本周期已完结累计未达上限**；201 新建、200 同号同内容幂等重放（不重新核对额度）、400 非法输入/未知核验或预约、409 状态冲突（附 `existingId`/`existingRunId`；待保养时附 `maintenanceRequired`、`limitSeconds`、`usedSeconds`、`countedRuns`），失败不留记录 |
 | GET | `/api/runs` | 运行列表（运行状态、超时标记、开始/结束时间与冻结依据；依据图当前可用性仅作展示） |
 | GET | `/api/runs/:id` | 单条运行详情（含冻结发布图快照、冻结核验结论、冻结预约时段） |
 | POST | `/api/runs/:id/complete` | 完结运行（`outcome` 为 `completed`/`aborted`；结束时间服务端记录且须晚于开始；超过预约终点如实完结并置 `timedOut`，随即释放设备、不改写预约）；201 首次完结、200 同状态幂等重放、400 非法 outcome、409 异状态改报（附 `existingOutcome`） |
 | GET | `/api/schedule?from=&to=` | 日程：各质量规格在时段内的预约占用分段（`segments`，占用超库存 `shortage`）、停用分段（`suspendedSegments`）与「占用+停用」合计分段（`combinedSegments`，合计超库存 `shortage` / 规格级 `combinedShortage`）；from/to 缺省为覆盖全部生效中预约与停用 |
+| GET | `/api/devices` | 设备状态列表：上限（未设置为 `null`）、本周期已完结累计秒数（`usedSeconds`）、剩余额度（`remainingSeconds`，未设置为 `null`）、超出秒数（`overSeconds`）、待保养（`due`）、是否运行中（`running`/`activeRunId`）、最近一次保养（`lastMaintenance`）、计入/总运行条数（`countedRuns`/`totalRuns`） |
+| GET | `/api/devices/:deviceNo` | 单台设备状态（含上述字段）；无任何运行/上限/保养记录返回 404 |
+| GET | `/api/device-limits` | 已设置的设备上限列表（未出现即未设置） |
+| PUT | `/api/device-limits` | 按设备编号设置/调整累计运行时长上限（`{deviceNo, limitSeconds}`，正整数秒）；仅影响后续开始判定，不改写历史；201 首次设置、200 调整既有；非法输入 400 |
+| DELETE | `/api/device-limits/:deviceNo` | 删除该设备上限（恢复未设置的原行为）；幂等 204 |
+| POST | `/api/maintenances` | 设备空闲时登记保养（唯一 `maintenanceNo` + `deviceNo` + 非空 `reason`；周期起点为服务端登记时刻）；201 新建、200 同号同内容幂等重放、400 非法输入、409 同号异内容（附 `existingId`）或设备运行中（附 `existingRunId`） |
+| GET | `/api/maintenances` | 保养记录列表（按周期起点倒序，含保养单号、设备、原因、周期起点） |
+| GET | `/api/maintenances/:id` | 单条保养记录；不存在 404 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
 预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
@@ -252,7 +288,9 @@ npm test
 逐对（`withinTolerance`）判定，可直接用于前端高亮定位；预约数量不足（含停用占用）时 409
 响应的 `detail.conflicts` 内带冲突规格、当前库存与超限时段（`windows`，含 `used` 预约占用
 与 `suspended` 停用量）；停用登记超量时 409 响应结构相同（`windows[].suspended` 为已停用
-数量），均可直接用于日程定位。
+数量），均可直接用于日程定位。设备累计运行时长达到上限时开始运行返回 409，顶层带
+`maintenanceRequired: true` 及 `deviceNo`、`limitSeconds`、`usedSeconds`、`overSeconds`、
+`countedRuns`、`lastMaintenanceId`，登记保养开启新周期后即可继续开始运行。
 
 ## 避邻对 HTTP API 调用示例
 
@@ -588,20 +626,101 @@ curl -s $BASE/api/runs
 curl -s $BASE/api/runs/10
 ```
 
+## 设备累计运行额度与保养 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 为设备设置累计运行时长上限（正整数秒）；首次 201，调整既有 200
+curl -s -X PUT $BASE/api/device-limits \
+  -H 'Content-Type: application/json' \
+  -d '{"deviceNo":"CENT-01","limitSeconds":3600}'
+# -> 201 {"deviceNo":"CENT-01","limitSeconds":3600,"createdAt":"...","updatedAt":"..."}
+
+# 非法上限（0/负数/小数/字符串/缺失）→ 400
+curl -s -X PUT $BASE/api/device-limits \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-01","limitSeconds":0}'
+# -> 400 {"errors":["上限必须是正整数秒数（按设备累计运行时长计时）"]}
+
+# 2) 查看设备状态：累计/剩余额度/待保养/运行中/最近保养/计入运行数
+#    尚无保养记录时 usedSeconds 为该设备全部已完结运行（完成+中止）按服务端
+#    起止时间的累计；进行中运行不计入（running=true 时另行标记 activeRunId）。
+curl -s $BASE/api/devices/CENT-01
+# -> {"deviceNo":"CENT-01","limitSeconds":3600,"running":false,"activeRunId":null,
+#     "lastMaintenance":null,"totalRuns":2,
+#     "due":false,"usedSeconds":2500.32,"remainingSeconds":1099.68,
+#     "overSeconds":0,"countedRuns":2}
+curl -s $BASE/api/devices          # 全部设备（有运行/上限/保养记录之一即出现）
+curl -s $BASE/api/device-limits    # 仅上限列表
+# 未设置上限的设备：limitSeconds=null、remainingSeconds=null、due 恒为 false
+# （usedSeconds 仍照常给出供参考，开始运行沿用原行为不核对额度）
+
+# 3) 达到上限后开始运行 → 409（原事务内核对），不留任何新运行记录
+curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-NEXT","deviceNo":"CENT-01","verificationId":3,"reservationId":7}'
+# -> 409 {"errors":["设备「CENT-01」…已完结运行累计 3600 秒，达到累计运行时长上限
+#                   3600 秒，须先登记保养（开启新累计周期）后再开始运行；本次运行已拒绝，
+#                   未留下任何记录"],
+#         "maintenanceRequired":true,"deviceNo":"CENT-01","limitSeconds":3600,
+#         "usedSeconds":3600,"overSeconds":0,"countedRuns":3,"lastMaintenanceId":null}
+
+# 4) 设备空闲时登记保养（唯一保养单号 + 设备 + 原因）；201 开启新累计周期
+curl -s -X POST $BASE/api/maintenances \
+  -H 'Content-Type: application/json' \
+  -d '{"maintenanceNo":"MT-2026-001","deviceNo":"CENT-01","reason":"达到累计运行时长，例行保养"}'
+# -> 201 {"id":1,"maintenanceNo":"MT-2026-001","deviceNo":"CENT-01",
+#         "reason":"达到累计运行时长，例行保养",
+#         "periodStartedAt":"2026-10-04T01:02:03.456Z","createdAt":"..."}
+# 此后仅开始时刻不早于 periodStartedAt 的已完结运行计入新周期；再次查询：
+curl -s $BASE/api/devices/CENT-01
+# -> {"due":false,"usedSeconds":0,"remainingSeconds":3600,"countedRuns":0,
+#     "lastMaintenance":{"id":1,"maintenanceNo":"MT-2026-001",...}}
+
+# 5) 幂等：同号同内容重试 → 200 原记录；同号异内容 → 409（附 existingId）
+curl -s -X POST $BASE/api/maintenances -H 'Content-Type: application/json' \
+  -d '{"maintenanceNo":"MT-2026-001","deviceNo":"CENT-01","reason":"达到累计运行时长，例行保养"}'
+# -> 200 同上（periodStartedAt 不变，不产生第二条）
+curl -s -X POST $BASE/api/maintenances -H 'Content-Type: application/json' \
+  -d '{"maintenanceNo":"MT-2026-001","deviceNo":"CENT-02","reason":"别的设备"}'
+# -> 409 {"errors":["保养单号「MT-2026-001」已被使用且登记内容不同，拒绝重复提交"],
+#         "existingId":1}
+
+# 6) 设备运行中登记 → 409（附 existingRunId），不留记录；完结释放后可登记
+curl -s -X POST $BASE/api/maintenances -H 'Content-Type: application/json' \
+  -d '{"maintenanceNo":"MT-BUSY","deviceNo":"CENT-01","reason":"x"}'
+# -> 409 {"errors":["设备「CENT-01」存在进行中的运行 #8（运行编号「RUN-NEXT」），
+#                   运行期间不能登记保养；请先完结该运行（完成/中止均会释放设备）"],
+#         "existingRunId":8}
+
+# 7) 调整上限仅影响后续开始判定（历史运行/保养不改写）；删除上限恢复原行为
+curl -s -X PUT $BASE/api/device-limits -H 'Content-Type: application/json' \
+  -d '{"deviceNo":"CENT-01","limitSeconds":7200}'   # 200，剩余额度立即按新上限重算
+curl -s -X DELETE $BASE/api/device-limits/CENT-01   # 204（重复删除亦 204）
+# 待保养期间，既有运行编号以相同开始内容重放仍返回原运行（200），不受额度影响：
+curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-2026-001","deviceNo":"CENT-01","verificationId":3,"reservationId":7}'
+# -> 200 原运行记录
+
+# 8) 保养记录列表 / 单条（按周期起点倒序）
+curl -s $BASE/api/maintenances
+curl -s $BASE/api/maintenances/1
+```
+
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行事务
-  db.js         SQLite 连接、建表（含固定孔位表与离心运行表）、数据访问
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行/保养事务
+  db.js         SQLite 连接、建表（含固定孔位、离心运行、设备上限与保养表）、数据访问
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
   reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
                 容量判定与日程（纯函数，含测试）
   run.js        离心运行：开始/完结输入规整、左闭右开时段与超时判定（纯函数，含测试）
+  maintenance.js 设备累计运行额度：上限/保养输入规整、已完结运行按周期累计与待保养判定（纯函数，含测试）
   validate.js   输入校验（非法质量/重复编号/越界/避邻对/固定孔位）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
-                + 时段预约 + 临时停用 + 离心运行，共 125 项）
+                + 时段预约 + 临时停用 + 离心运行 + 设备额度与保养，共 135 项）
 Dockerfile / docker-compose.yml
 ```

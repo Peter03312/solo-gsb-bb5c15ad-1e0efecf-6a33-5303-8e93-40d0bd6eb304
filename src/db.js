@@ -173,6 +173,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_reservation
   ON runs (reservation_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_device_active
   ON runs (device_no) WHERE ended_at IS NULL;
+
+-- 设备累计运行时长上限：按设备编号设置正整数秒数；不存在行 = 未设置上限，
+-- 该设备开始运行沿用原行为（不核对额度）。调整上限仅影响后续开始判定，
+-- 不改写任何运行与保养历史。
+CREATE TABLE IF NOT EXISTS device_limits (
+  device_no TEXT PRIMARY KEY,
+  limit_seconds INTEGER NOT NULL CHECK (limit_seconds > 0),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 设备保养登记：唯一保养单号为幂等键（同号同内容重试返回原记录，
+-- 同号不同内容或设备运行中拒绝）。仅设备空闲（无进行中运行）时可登记，
+-- 登记成功开启新的累计周期（period_started_at 为服务端时刻），
+-- 仅开始时刻不早于该时刻的已完结运行计入新周期；历史永不改写。
+CREATE TABLE IF NOT EXISTS maintenances (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  maintenance_no TEXT NOT NULL UNIQUE,
+  device_no TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  period_started_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_maintenances_device
+  ON maintenances (device_no, period_started_at);
 `;
 
 // ---------- 读取 ----------
@@ -565,4 +590,72 @@ export function completeRun(db, id, { outcome, endUtc, timedOut }) {
     )
     .run(outcome, endUtc, timedOut ? 1 : 0, id);
   return info.changes === 1 ? getRunRow(db, id) : null;
+}
+
+// ---------- 设备累计运行时长上限与保养 ----------
+
+export function getDeviceLimitRow(db, deviceNo) {
+  return db.prepare('SELECT * FROM device_limits WHERE device_no = ?').get(deviceNo);
+}
+
+export function listDeviceLimitRows(db) {
+  return db.prepare('SELECT * FROM device_limits ORDER BY device_no').all();
+}
+
+export function upsertDeviceLimit(db, { deviceNo, limitSeconds }) {
+  db.prepare(
+    `INSERT INTO device_limits (device_no, limit_seconds)
+     VALUES (?, ?)
+     ON CONFLICT(device_no) DO UPDATE SET
+       limit_seconds = excluded.limit_seconds,
+       updated_at = datetime('now')`,
+  ).run(deviceNo, limitSeconds);
+  return getDeviceLimitRow(db, deviceNo);
+}
+
+// 删除上限（恢复未设置行为）；返回是否命中既有行。
+export function deleteDeviceLimit(db, deviceNo) {
+  const info = db.prepare('DELETE FROM device_limits WHERE device_no = ?').run(deviceNo);
+  return info.changes === 1;
+}
+
+export function getMaintenanceRowByNo(db, maintenanceNo) {
+  return db.prepare('SELECT * FROM maintenances WHERE maintenance_no = ?').get(maintenanceNo);
+}
+
+export function getMaintenanceRow(db, id) {
+  return db.prepare('SELECT * FROM maintenances WHERE id = ?').get(id);
+}
+
+export function listMaintenanceRows(db) {
+  return db.prepare('SELECT * FROM maintenances ORDER BY period_started_at DESC, id DESC').all();
+}
+
+// 设备最近一次保养（当前累计周期起点）；无记录返回 null。
+export function getLatestMaintenanceRow(db, deviceNo) {
+  return db
+    .prepare(
+      `SELECT * FROM maintenances
+        WHERE device_no = ?
+        ORDER BY period_started_at DESC, id DESC
+        LIMIT 1`,
+    )
+    .get(deviceNo);
+}
+
+export function insertMaintenance(db, { maintenanceNo, deviceNo, reason, startedAtUtc }) {
+  const info = db
+    .prepare(
+      `INSERT INTO maintenances (maintenance_no, device_no, reason, period_started_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(maintenanceNo, deviceNo, reason, startedAtUtc);
+  return getMaintenanceRow(db, info.lastInsertRowid);
+}
+
+// 某设备的全部运行（调用方用 summarizeUsage 按时点过滤已完结/进行中）。
+export function listRunRowsByDevice(db, deviceNo) {
+  return db
+    .prepare('SELECT * FROM runs WHERE device_no = ? ORDER BY start_utc, id')
+    .all(deviceNo);
 }
