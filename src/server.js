@@ -40,6 +40,16 @@ import {
   getActiveRunRowByDevice,
   insertRun,
   completeRun,
+  listRunRowsByDevice,
+  getDeviceLimitRow,
+  listDeviceLimitRows,
+  upsertDeviceLimit,
+  deleteDeviceLimit,
+  getMaintenanceRow,
+  getMaintenanceRowByNo,
+  listMaintenanceRows,
+  getLatestMaintenanceRow,
+  insertMaintenance,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -57,6 +67,12 @@ import {
   isWithinReservation,
   isOverrun,
 } from './run.js';
+import {
+  normalizeLimitInput,
+  normalizeDeviceNo,
+  normalizeMaintenanceInput,
+  summarizeDevice,
+} from './maintenance.js';
 import {
   ValidationError,
   ConflictError,
@@ -101,6 +117,8 @@ export function createApp(db) {
       ),
       suspensions: listSuspensionRows(db).map((r) => suspensionView(r, Date.now())),
       runs: listRunRows(db).map((r) => runView(r, hash, Date.now())),
+      devices: listDeviceViews(db),
+      maintenances: listMaintenanceRows(db).map(maintenanceView),
     });
   });
 
@@ -1024,7 +1042,9 @@ export function createApp(db) {
   //   3. 发布图当前可用（数据指纹与当前录入一致、图可行）；
   //   4. 当前时刻处于预约左闭右开时段 [start, end)；
   //   5. 该预约未被其他运行使用（一个预约至多一次运行）；
-  //   6. 同设备无进行中运行。
+  //   6. 同设备无进行中运行；
+  //   7. 设备保养额度：设置了上限的设备，本累计周期已完结运行累计时长达到
+  //      上限即拒绝（未设置上限的设备不核对，沿用原行为）。
   // 任一冲突即 409 回滚，不留记录。开始后冻结发布图（编号/指纹/快照）、核验结论
   // 与预约时段。完结填写 completed/aborted，结束时间须晚于开始；超过预约终点仍如实
   // 完结并标记 timedOut，随即释放设备（部分唯一索引）；不改写预约。
@@ -1207,6 +1227,25 @@ export function createApp(db) {
           ], { existingRunId: activeOnDevice.id });
         }
 
+        // 7. 设备保养额度：设置了上限的设备，自最近一次保养后已完结运行累计时长
+        //    达到上限即拒绝（须先登记保养开启新累计周期）；未设置上限的设备不核对，
+        //    沿用原行为。进行中的运行不提前计入；既有运行编号的幂等重放在上方
+        //    已先行返回，不受额度变化影响。
+        const limitRow = getDeviceLimitRow(db, deviceNo);
+        if (limitRow) {
+          const dev = deviceView(db, deviceNo);
+          if (dev.maintenanceDue) {
+            throw new ConflictError(
+              [
+                `设备「${deviceNo}」自最近一次保养后已完结运行累计 ${dev.usedSeconds} 秒，` +
+                  `已达到保养上限 ${dev.limitSeconds} 秒（剩余额度 ${Math.max(0, dev.remainingSeconds)} 秒），` +
+                  '设备待保养：须先登记保养开启新累计周期，再开始新的运行',
+              ],
+              { detail: { device: dev } },
+            );
+          }
+        }
+
         const row = insertRun(db, {
           runNo,
           deviceNo,
@@ -1306,6 +1345,170 @@ export function createApp(db) {
     } catch (e) {
       next(e);
     }
+  });
+
+  // ---------- 设备保养 ----------
+  //
+  // 实验室按设备累计运行时长安排保养：
+  //   - 可按设备编号设置正整数秒数上限（PUT .../limit 设置/调整，DELETE 清除）；
+  //     调整仅影响后续开始判定，不改写运行及保养历史；未设置上限的设备沿用原行为；
+  //   - 设备状态：自最近一次保养后已完结运行的累计时长、剩余额度与待保养状态
+  //     （尚无保养记录时计入全部已完结运行；完成/中止均按服务端起止时间计入，
+  //     进行中的运行不提前计入；越过上限如实呈现，剩余额度可为 0 或负数）；
+  //   - 设备空闲时可凭「唯一保养单号 + 设备编号 + 原因」登记保养，登记时刻
+  //     （服务端记录）开启新累计周期；同号同内容重试返回原记录（200），
+  //     异内容或设备运行中拒绝（409）。
+
+  // 单台设备保养状态视图（供状态查询与开始运行前的事务内核对共用）
+  function deviceView(dbArg, deviceNo) {
+    const limitRow = getDeviceLimitRow(dbArg, deviceNo);
+    const lastMaint = getLatestMaintenanceRow(dbArg, deviceNo);
+    const runs = listRunRowsByDevice(dbArg, deviceNo);
+    const active = runs.find((r) => r.ended_at === null) || null;
+    const summary = summarizeDevice({
+      deviceNo,
+      limitSeconds: limitRow ? limitRow.limit_seconds : null,
+      runs: runs.map((r) => ({ startUtc: r.start_utc, endedAt: r.ended_at })),
+      lastMaintenanceAt: lastMaint ? lastMaint.created_at : null,
+    });
+    return {
+      ...summary,
+      running: !!active,
+      activeRunId: active ? active.id : null,
+      activeRunNo: active ? active.run_no : null,
+      maintenanceCount: dbArg
+        .prepare('SELECT COUNT(*) AS c FROM maintenances WHERE device_no = ?')
+        .get(deviceNo).c,
+      lastMaintenanceAt: lastMaint ? lastMaint.created_at : null,
+    };
+  }
+
+  // 已知设备 = 出现过运行、设置过上限或登记过保养的设备编号并集
+  function listDeviceViews(dbArg) {
+    const deviceNos = new Set();
+    for (const r of dbArg.prepare('SELECT DISTINCT device_no FROM runs').all()) {
+      deviceNos.add(r.device_no);
+    }
+    for (const r of listDeviceLimitRows(dbArg)) deviceNos.add(r.device_no);
+    for (const m of listMaintenanceRows(dbArg)) deviceNos.add(m.device_no);
+    return [...deviceNos].sort().map((d) => deviceView(dbArg, d));
+  }
+
+  function deviceKnown(dbArg, deviceNo) {
+    if (getDeviceLimitRow(dbArg, deviceNo)) return true;
+    if (getLatestMaintenanceRow(dbArg, deviceNo)) return true;
+    return !!dbArg
+      .prepare('SELECT 1 FROM runs WHERE device_no = ? LIMIT 1')
+      .get(deviceNo);
+  }
+
+  function maintenanceView(row) {
+    return {
+      id: row.id,
+      maintNo: row.maint_no,
+      deviceNo: row.device_no,
+      reason: row.reason,
+      createdAt: row.created_at,
+    };
+  }
+
+  app.get('/api/devices', (req, res) => {
+    res.json(listDeviceViews(db));
+  });
+
+  app.get('/api/devices/:deviceNo', (req, res) => {
+    const deviceNo = String(req.params.deviceNo || '').trim();
+    if (!deviceKnown(db, deviceNo)) {
+      return res.status(404).json({ error: '设备不存在（无运行、上限或保养记录）' });
+    }
+    res.json(deviceView(db, deviceNo));
+  });
+
+  // 设置/调整保养上限（正整数秒）：仅影响后续开始判定，不改写历史。
+  app.put('/api/devices/:deviceNo/limit', (req, res, next) => {
+    try {
+      const dev = normalizeDeviceNo(req.params.deviceNo);
+      if (dev.errors.length) throw new ValidationError(dev.errors);
+      const { errors, clean } = normalizeLimitInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      upsertDeviceLimit(db, dev.clean.deviceNo, clean.limitSeconds);
+      res.json(deviceView(db, dev.clean.deviceNo));
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 清除保养上限：设备回到「未设置上限」的原行为（幂等）。
+  app.delete('/api/devices/:deviceNo/limit', (req, res, next) => {
+    try {
+      const dev = normalizeDeviceNo(req.params.deviceNo);
+      if (dev.errors.length) throw new ValidationError(dev.errors);
+      deleteDeviceLimit(db, dev.clean.deviceNo);
+      res.json(deviceView(db, dev.clean.deviceNo));
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 登记保养：设备空闲时凭唯一保养单号开启新累计周期。
+  // 同号同内容重试返回原记录（200）；异内容或设备运行中拒绝（409）。
+  app.post('/api/maintenances', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeMaintenanceInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { maintNo, deviceNo, reason } = clean;
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：同保养单号——内容一致返回原记录，不一致拒绝
+        const existing = getMaintenanceRowByNo(db, maintNo);
+        if (existing) {
+          const same = existing.device_no === deviceNo && existing.reason === reason;
+          if (!same) {
+            throw new ConflictError(
+              [`保养单号「${maintNo}」已被使用且登记内容不同，拒绝重复提交`],
+              { existingId: existing.id },
+            );
+          }
+          view = maintenanceView(existing);
+          status = 200;
+          return;
+        }
+        // 设备须空闲（无进行中运行）方可登记保养
+        const active = getActiveRunRowByDevice(db, deviceNo);
+        if (active) {
+          throw new ConflictError(
+            [
+              `设备「${deviceNo}」存在进行中的运行 #${active.id}` +
+                `（运行编号「${active.run_no}」），须待运行完结、设备空闲后方可登记保养`,
+            ],
+            { existingRunId: active.id },
+          );
+        }
+        const row = insertMaintenance(db, {
+          maintNo,
+          deviceNo,
+          reason,
+          createdAt: toIso(Date.now()),
+        });
+        view = maintenanceView(row);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/maintenances', (req, res) => {
+    res.json(listMaintenanceRows(db).map(maintenanceView));
+  });
+
+  app.get('/api/maintenances/:id', (req, res) => {
+    const row = getMaintenanceRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '保养记录不存在' });
+    res.json(maintenanceView(row));
   });
 
   // ---------- 静态前端 ----------

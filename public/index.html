@@ -234,6 +234,53 @@
       <h3>运行列表（含运行状态、超时标记与冻结依据）</h3>
       <div id="run-list"></div>
     </section>
+
+    <section class="card" id="sec-maint">
+      <h2>12. 设备保养（按累计运行时长）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        按设备编号设置<b>正整数秒数</b>的保养上限：系统统计<b>自最近一次保养后已完结运行</b>的
+        累计时长（完成 / 中止均按服务端起止时间计入，进行中不提前计入；尚无保养记录时计入
+        全部已完结运行），并给出剩余额度与待保养状态。运行即使越过上限也如实完结并释放设备；
+        达到上限后<b>新的运行将被拒绝</b>（未设置上限的设备不核对，沿用原行为）。
+        设备空闲时可凭<b>唯一保养单号 + 设备编号 + 原因</b>登记保养并开启新累计周期；
+        同号同内容重试返回原记录，异内容或设备运行中拒绝。调整上限仅影响后续开始判定，
+        不改写运行及保养历史。
+      </div>
+      <h3>设备状态</h3>
+      <div id="dev-list"></div>
+      <h3>设置 / 调整保养上限</h3>
+      <div class="form-row">
+        <label>设备编号
+          <input id="dev-limit-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>保养上限（秒，正整数）
+          <input id="dev-limit-seconds" type="number" min="1" step="1" placeholder="如 3600" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="dev-limit-save" class="primary">保存上限（仅影响后续开始判定）</button>
+        <button id="dev-limit-clear" class="danger">清除该设备上限（恢复原行为）</button>
+      </div>
+      <h3>登记保养（设备空闲时开启新累计周期）</h3>
+      <div class="form-row">
+        <label>保养单号（唯一）
+          <input id="maint-no" type="text" placeholder="如 MAINT-2026-001" />
+        </label>
+        <label>设备编号
+          <input id="maint-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>保养原因
+          <input id="maint-reason" type="text" placeholder="如：月度保养 / 更换轴承" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="maint-submit" class="primary">登记保养</button>
+      </div>
+      <div id="maint-conflict"></div>
+      <h3>保养记录</h3>
+      <div id="maint-list"></div>
+      <datalist id="known-devices"></datalist>
+    </section>
   </main>
 
   <dialog id="pub-dialog">
